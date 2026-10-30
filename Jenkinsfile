@@ -49,9 +49,11 @@ pipeline {
                     bat '''
                         @echo off
 
-                        echo %REGISTRY_PASS% | docker login %REGISTRY_URL% -u "%REGISTRY_USER%" --password-stdin
+                        powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$env:REGISTRY_PASS | docker login $env:REGISTRY_URL --username $env:REGISTRY_USER --password-stdin; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
 
                         if errorlevel 1 exit /b 1
+
+                        echo Registry login successful.
                     '''
                 }
             }
@@ -71,7 +73,7 @@ pipeline {
                     docker push %IMAGE_NAME%:%ROLLBACK_TAG%
                     if errorlevel 1 exit /b 1
 
-                    echo Healthy V4 backup saved.
+                    echo Previous healthy V4 backup completed.
                 '''
             }
         }
@@ -85,7 +87,7 @@ pipeline {
 
                     if errorlevel 1 exit /b 1
 
-                    echo V4 image built successfully.
+                    echo V4 Docker image built successfully.
                 '''
             }
         }
@@ -106,78 +108,59 @@ pipeline {
 
         stage('Deploy V4 and Automatic Rollback') {
             steps {
-                script {
-                    try {
+                bat '''
+                    @echo off
 
-                        echo "Deploying V4 application..."
+                    echo Pulling V4 image...
 
-                        bat '''
-                            @echo off
+                    docker pull %IMAGE_NAME%:%APP_VERSION%
+                    if errorlevel 1 exit /b 1
 
-                            docker pull %IMAGE_NAME%:%APP_VERSION%
-                            if errorlevel 1 exit /b 1
+                    echo Removing previous application container...
 
-                            docker rm -f %CONTAINER_NAME% 2>NUL
+                    docker rm -f %CONTAINER_NAME% >NUL 2>&1
 
-                            docker run -d --restart unless-stopped --name %CONTAINER_NAME% -p %APP_PORT%:80 %IMAGE_NAME%:%APP_VERSION%
+                    echo Starting V4 application...
 
-                            if errorlevel 1 exit /b 1
-                        '''
+                    docker run -d --name %CONTAINER_NAME% -p %APP_PORT%:80 %IMAGE_NAME%:%APP_VERSION%
 
-                        bat '''
-                            powershell -NoProfile -Command "Start-Sleep -Seconds 10"
-                        '''
+                    if errorlevel 1 goto rollback
 
-                        echo "Checking V4 application health..."
+                    timeout /t 10 /nobreak >NUL
 
-                        bat '''
-                            @echo off
+                    echo Checking V4 application health...
 
-                            powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $r=Invoke-WebRequest -Uri 'http://localhost:8085/' -UseBasicParsing; if ($r.StatusCode -ne 200 -or $r.Content -notmatch 'Application Version V4' -or $r.Content -notmatch 'Status: HEALTHY') { exit 1 }"
+                    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "try { $r = Invoke-WebRequest -Uri 'http://localhost:8085/' -UseBasicParsing -TimeoutSec 10; if ($r.StatusCode -ne 200 -or $r.Content -notmatch 'Application Version V4' -or $r.Content -notmatch 'Status: HEALTHY') { exit 1 }; Write-Host 'V4 health check passed.'; exit 0 } catch { Write-Host $_; exit 1 }"
 
-                            if errorlevel 1 exit /b 1
-                        '''
+                    if not errorlevel 1 goto healthy
 
-                        echo "V4 DEPLOYMENT SUCCESSFUL!"
-                        echo "Application is healthy on port 8085."
+                    :rollback
 
-                    } catch (Exception e) {
+                    echo V4 deployment failed. Starting automatic rollback...
 
-                        echo "V4 DEPLOYMENT FAILED!"
-                        echo "STARTING AUTOMATIC ROLLBACK..."
+                    docker rm -f %CONTAINER_NAME% >NUL 2>&1
 
-                        bat '''
-                            @echo off
+                    docker pull %IMAGE_NAME%:%ROLLBACK_TAG%
+                    if errorlevel 1 exit /b 1
 
-                            docker rm -f %CONTAINER_NAME% 2>NUL
+                    docker run -d --name %CONTAINER_NAME% -p %APP_PORT%:80 %IMAGE_NAME%:%ROLLBACK_TAG%
+                    if errorlevel 1 exit /b 1
 
-                            docker pull %IMAGE_NAME%:%ROLLBACK_TAG%
-                            if errorlevel 1 exit /b 1
+                    timeout /t 10 /nobreak >NUL
 
-                            docker run -d --restart unless-stopped --name %CONTAINER_NAME% -p %APP_PORT%:80 %IMAGE_NAME%:%ROLLBACK_TAG%
+                    echo Checking rollback application health...
 
-                            if errorlevel 1 exit /b 1
-                        '''
+                    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "try { $r = Invoke-WebRequest -Uri 'http://localhost:8085/' -UseBasicParsing -TimeoutSec 10; if ($r.StatusCode -ne 200 -or $r.Content -notmatch 'Application Version V4' -or $r.Content -notmatch 'Status: HEALTHY') { exit 1 }; Write-Host 'Rollback health check passed.'; exit 0 } catch { Write-Host $_; exit 1 }"
 
-                        bat '''
-                            powershell -NoProfile -Command "Start-Sleep -Seconds 10"
-                        '''
+                    if errorlevel 1 exit /b 1
 
-                        echo "Verifying restored application..."
+                    echo AUTOMATIC ROLLBACK SUCCESSFUL.
+                    exit /b 1
 
-                        bat '''
-                            @echo off
+                    :healthy
 
-                            powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $r=Invoke-WebRequest -Uri 'http://localhost:8085/' -UseBasicParsing; if ($r.StatusCode -ne 200 -or $r.Content -notmatch 'Application Version V4' -or $r.Content -notmatch 'Status: HEALTHY') { exit 1 }"
-
-                            if errorlevel 1 exit /b 1
-                        '''
-
-                        echo "AUTOMATIC ROLLBACK SUCCESSFUL!"
-
-                        error("V4 deployment failed. Previous healthy V4 restored.")
-                    }
-                }
+                    echo V4 DEPLOYED SUCCESSFULLY.
+                '''
             }
         }
     }
@@ -187,16 +170,15 @@ pipeline {
             bat '''
                 @echo off
                 docker logout %REGISTRY_URL% >NUL 2>&1
-                exit /b 0
             '''
         }
 
         success {
-            echo "PIPELINE SUCCESSFUL - V4 IS RUNNING!"
+            echo 'SUCCESS: V4 application deployed and healthy.'
         }
 
         failure {
-            echo "PIPELINE FAILED - CHECK JENKINS CONSOLE LOG."
+            echo 'PIPELINE FAILED - CHECK JENKINS CONSOLE LOG.'
         }
     }
 }
