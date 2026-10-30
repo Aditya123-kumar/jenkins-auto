@@ -1,10 +1,10 @@
-
 pipeline {
     agent any
 
     environment {
         IMAGE = "localhost:5000/rollback-app"
         CONTAINER_NAME = "jenkins-rollback-app"
+        APP_URL = "http://localhost:8085/"
     }
 
     stages {
@@ -12,9 +12,6 @@ pipeline {
         stage('Prepare Versions') {
             steps {
                 script {
-                    // First Jenkins build creates V2
-                    env.NEW_TAG = "v${env.BUILD_NUMBER.toInteger() + 1}"
-
                     def exists = bat(
                         script: '@echo off\r\ndocker inspect jenkins-rollback-app >NUL 2>&1',
                         returnStatus: true
@@ -26,13 +23,18 @@ pipeline {
                             returnStdout: true
                         ).trim()
 
-                        env.PREVIOUS_TAG =
-                            env.PREVIOUS_IMAGE.substring(
-                                env.PREVIOUS_IMAGE.lastIndexOf(':') + 1
-                            )
+                        env.PREVIOUS_TAG = env.PREVIOUS_IMAGE.substring(
+                            env.PREVIOUS_IMAGE.lastIndexOf(':') + 1
+                        )
                     } else {
                         env.PREVIOUS_TAG = "v1"
                     }
+
+                    def previousNumber = env.PREVIOUS_TAG
+                        .replaceFirst('^v', '')
+                        .toInteger()
+
+                    env.NEW_TAG = "v${previousNumber + 1}"
 
                     echo "Previous Version: ${env.PREVIOUS_TAG}"
                     echo "New Version: ${env.NEW_TAG}"
@@ -43,6 +45,7 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 bat '''
+                    @echo off
                     docker build -t %IMAGE%:%NEW_TAG% .
                     if errorlevel 1 exit /b 1
                 '''
@@ -86,12 +89,12 @@ pipeline {
 
                         bat '''
                             @echo off
-
                             powershell -NoProfile -Command "$env:REGISTRY_PASSWORD | docker login localhost:5000 --username $env:REGISTRY_USER --password-stdin"
                             if errorlevel 1 exit /b 1
                         '''
 
                         try {
+
                             bat '''
                                 @echo off
 
@@ -105,9 +108,10 @@ pipeline {
                                 docker compose up -d --no-build --force-recreate
                                 if errorlevel 1 exit /b 1
 
-                                timeout /t 8 /nobreak >NUL
+                                timeout /t 10 /nobreak >NUL
 
-                                curl.exe -fsS http://localhost:8085/ | findstr /I /C:"Application Version %NEW_TAG%"
+                                powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing http://localhost:8085/; if ($r.Content -notmatch 'Application Version %NEW_TAG%') { exit 1 } } catch { exit 1 }"
+
                                 if errorlevel 1 exit /b 1
                             '''
 
@@ -131,9 +135,10 @@ pipeline {
                                 docker compose up -d --no-build --force-recreate
                                 if errorlevel 1 exit /b 1
 
-                                timeout /t 8 /nobreak >NUL
+                                timeout /t 10 /nobreak >NUL
 
-                                curl.exe -fsS http://localhost:8085/ | findstr /I /C:"Application Version %PREVIOUS_TAG%"
+                                powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing http://localhost:8085/; if ($r.Content -notmatch 'Application Version %PREVIOUS_TAG%') { exit 1 } } catch { exit 1 }"
+
                                 if errorlevel 1 exit /b 1
                             '''
 
@@ -160,4 +165,3 @@ pipeline {
         }
     }
 }
-s
