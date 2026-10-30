@@ -1,0 +1,9 @@
+services:
+  web:
+    image: localhost:5000/rollback-app:${IMAGE_TAG:-latest}
+    build:
+      context: .
+    container_name: jenkins-rollback-app
+    ports:
+      - "8085:80"
+    restart: unless-stopped
