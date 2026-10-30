@@ -1,10 +1,12 @@
+
 pipeline {
     agent any
 
     environment {
-        IMAGE = "localhost:5000/rollback-app"
-        CONTAINER_NAME = "jenkins-rollback-app"
-        APP_URL = "http://localhost:8085/"
+        IMAGE = 'localhost:5000/rollback-app'
+        CONTAINER = 'jenkins-rollback-app'
+        REGISTRY_CREDENTIALS = 'registry-creds'
+        APP_PORT = '8085'
     }
 
     stages {
@@ -12,29 +14,31 @@ pipeline {
         stage('Prepare Versions') {
             steps {
                 script {
-                    def exists = bat(
-                        script: '@echo off\r\ndocker inspect jenkins-rollback-app >NUL 2>&1',
-                        returnStatus: true
-                    )
+                    def previousTag = 'v1'
 
-                    if (exists == 0) {
-                        env.PREVIOUS_IMAGE = bat(
-                            script: '@echo off\r\ndocker inspect --format "{{.Config.Image}}" jenkins-rollback-app',
+                    def containerExists = bat(
+                        script: 'docker inspect %CONTAINER% >nul 2>&1',
+                        returnStatus: true
+                    ) == 0
+
+                    if (containerExists) {
+                        def currentImage = bat(
+                            script: 'docker inspect --format="{{.Config.Image}}" %CONTAINER%',
                             returnStdout: true
                         ).trim()
 
-                        env.PREVIOUS_TAG = env.PREVIOUS_IMAGE.substring(
-                            env.PREVIOUS_IMAGE.lastIndexOf(':') + 1
-                        )
-                    } else {
-                        env.PREVIOUS_TAG = "v1"
+                        def matcher = currentImage =~ /:(v\d+)$/
+
+                        if (matcher.find()) {
+                            previousTag = matcher.group(1)
+                        }
                     }
 
-                    def previousNumber = env.PREVIOUS_TAG
-                        .replaceFirst('^v', '')
-                        .toInteger()
+                    def versionNumber = previousTag.replace('v', '').toInteger()
+                    def newTag = "v${versionNumber + 1}"
 
-                    env.NEW_TAG = "v${previousNumber + 1}"
+                    env.PREVIOUS_TAG = previousTag
+                    env.NEW_TAG = newTag
 
                     echo "Previous Version: ${env.PREVIOUS_TAG}"
                     echo "New Version: ${env.NEW_TAG}"
@@ -45,7 +49,6 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 bat '''
-                    @echo off
                     docker build -t %IMAGE%:%NEW_TAG% .
                     if errorlevel 1 exit /b 1
                 '''
@@ -56,15 +59,13 @@ pipeline {
             steps {
                 withCredentials([
                     usernamePassword(
-                        credentialsId: 'registry-creds',
+                        credentialsId: "${REGISTRY_CREDENTIALS}",
                         usernameVariable: 'REGISTRY_USER',
                         passwordVariable: 'REGISTRY_PASSWORD'
                     )
                 ]) {
                     bat '''
-                        @echo off
-
-                        powershell -NoProfile -Command "$env:REGISTRY_PASSWORD | docker login localhost:5000 --username $env:REGISTRY_USER --password-stdin"
+                        docker login localhost:5000 -u "%REGISTRY_USER%" -p "%REGISTRY_PASSWORD%"
                         if errorlevel 1 exit /b 1
 
                         docker push %IMAGE%:%NEW_TAG%
@@ -79,76 +80,76 @@ pipeline {
         stage('Deploy and Health Check') {
             steps {
                 script {
-                    withCredentials([
-                        usernamePassword(
-                            credentialsId: 'registry-creds',
-                            usernameVariable: 'REGISTRY_USER',
-                            passwordVariable: 'REGISTRY_PASSWORD'
-                        )
-                    ]) {
-
-                        bat '''
-                            @echo off
-                            powershell -NoProfile -Command "$env:REGISTRY_PASSWORD | docker login localhost:5000 --username $env:REGISTRY_USER --password-stdin"
-                            if errorlevel 1 exit /b 1
-                        '''
-
-                        try {
-
+                    try {
+                        withCredentials([
+                            usernamePassword(
+                                credentialsId: "${REGISTRY_CREDENTIALS}",
+                                usernameVariable: 'REGISTRY_USER',
+                                passwordVariable: 'REGISTRY_PASSWORD'
+                            )
+                        ]) {
                             bat '''
-                                @echo off
-
-                                echo Deploying new version: %NEW_TAG%
+                                docker login localhost:5000 -u "%REGISTRY_USER%" -p "%REGISTRY_PASSWORD%"
+                                if errorlevel 1 exit /b 1
 
                                 docker pull %IMAGE%:%NEW_TAG%
                                 if errorlevel 1 exit /b 1
 
                                 set IMAGE_TAG=%NEW_TAG%
-
                                 docker compose up -d --no-build --force-recreate
                                 if errorlevel 1 exit /b 1
 
-                                timeout /t 10 /nobreak >NUL
+                                timeout /t 10 /nobreak
 
-                                powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing http://localhost:8085/; if ($r.Content -notmatch 'Application Version %NEW_TAG%') { exit 1 } } catch { exit 1 }"
-
+                                curl.exe -fsS http://localhost:%APP_PORT%/ -o healthcheck.html
                                 if errorlevel 1 exit /b 1
+
+                                findstr /i /c:"Application Version %NEW_TAG%" healthcheck.html
+                                if errorlevel 1 exit /b 1
+
+                                docker logout localhost:5000
                             '''
+                        }
 
-                            echo "Deployment Successful: ${env.NEW_TAG}"
+                        echo "Deployment Successful: ${env.NEW_TAG}"
 
-                        } catch (Exception e) {
+                    } catch (Exception e) {
 
-                            echo "Deployment Failed!"
-                            echo "Starting Automatic Rollback..."
+                        echo "Deployment Failed: ${env.NEW_TAG}"
+                        echo "Starting Rollback to ${env.PREVIOUS_TAG}"
 
+                        withCredentials([
+                            usernamePassword(
+                                credentialsId: "${REGISTRY_CREDENTIALS}",
+                                usernameVariable: 'REGISTRY_USER',
+                                passwordVariable: 'REGISTRY_PASSWORD'
+                            )
+                        ]) {
                             bat '''
-                                @echo off
-
-                                echo Restoring previous version: %PREVIOUS_TAG%
+                                docker login localhost:5000 -u "%REGISTRY_USER%" -p "%REGISTRY_PASSWORD%"
+                                if errorlevel 1 exit /b 1
 
                                 docker pull %IMAGE%:%PREVIOUS_TAG%
                                 if errorlevel 1 exit /b 1
 
                                 set IMAGE_TAG=%PREVIOUS_TAG%
-
                                 docker compose up -d --no-build --force-recreate
                                 if errorlevel 1 exit /b 1
 
-                                timeout /t 10 /nobreak >NUL
+                                timeout /t 10 /nobreak
 
-                                powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing http://localhost:8085/; if ($r.Content -notmatch 'Application Version %PREVIOUS_TAG%') { exit 1 } } catch { exit 1 }"
-
+                                curl.exe -fsS http://localhost:%APP_PORT%/ -o healthcheck.html
                                 if errorlevel 1 exit /b 1
+
+                                findstr /i /c:"Application Version %PREVIOUS_TAG%" healthcheck.html
+                                if errorlevel 1 exit /b 1
+
+                                docker logout localhost:5000
                             '''
-
-                            echo "Rollback Successful: ${env.PREVIOUS_TAG}"
-
-                            error("Deployment Failed - Previous Version Restored")
-
-                        } finally {
-                            bat 'docker logout localhost:5000'
                         }
+
+                        echo "Rollback Successful: ${env.PREVIOUS_TAG}"
+                        throw e
                     }
                 }
             }
@@ -157,11 +158,11 @@ pipeline {
 
     post {
         success {
-            echo 'CI/CD Pipeline Completed Successfully!'
+            echo 'Pipeline completed successfully!'
         }
 
         failure {
-            echo 'CI/CD Pipeline Failed. Check Console Output.'
+            echo 'Pipeline failed. Check deployment and rollback logs.'
         }
     }
 }
