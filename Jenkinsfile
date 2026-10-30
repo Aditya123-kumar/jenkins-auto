@@ -99,7 +99,7 @@ pipeline {
                                 docker compose up -d --no-build --force-recreate
                                 if errorlevel 1 exit /b 1
 
-                                timeout /t 10 /nobreak
+                                powershell -NoProfile -Command "Start-Sleep -Seconds 10"
 
                                 curl.exe -fsS http://localhost:%APP_PORT%/ -o healthcheck.html
                                 if errorlevel 1 exit /b 1
@@ -136,7 +136,7 @@ pipeline {
                                 docker compose up -d --no-build --force-recreate
                                 if errorlevel 1 exit /b 1
 
-                                timeout /t 10 /nobreak
+                                powershell -NoProfile -Command "Start-Sleep -Seconds 10"
 
                                 curl.exe -fsS http://localhost:%APP_PORT%/ -o healthcheck.html
                                 if errorlevel 1 exit /b 1
