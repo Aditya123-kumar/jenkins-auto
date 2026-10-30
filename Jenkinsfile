@@ -7,31 +7,22 @@ pipeline {
         CONTAINER_NAME = "jenkins-rollback-app"
         APP_PORT = "8085"
         REGISTRY_URL = "localhost:5000"
+        ROLLBACK_TAG = "rollback"
+        INITIAL_TAG = "v8"
     }
 
     stages {
 
-        stage('Prepare Versions') {
+        stage('Prepare Version') {
             steps {
                 script {
-                    env.PREVIOUS_TAG = "v${env.BUILD_NUMBER}"
                     env.NEW_TAG = "v${env.BUILD_NUMBER.toInteger() + 1}"
-
-                    echo "Previous Version: ${env.PREVIOUS_TAG}"
                     echo "New Version: ${env.NEW_TAG}"
                 }
             }
         }
 
-        stage('Build Docker Image') {
-            steps {
-                bat '''
-                    docker build -t %IMAGE_NAME%:%NEW_TAG% -f app\\Dockerfile app
-                '''
-            }
-        }
-
-        stage('Push Image to Private Registry') {
+        stage('Login and Initialize Rollback') {
             steps {
                 withCredentials([
                     usernamePassword(
@@ -44,95 +35,142 @@ pipeline {
                         @echo off
                         echo %REGISTRY_PASS% | docker login %REGISTRY_URL% -u "%REGISTRY_USER%" --password-stdin
                         if errorlevel 1 exit /b 1
-
-                        docker push %IMAGE_NAME%:%NEW_TAG%
-                        if errorlevel 1 exit /b 1
                     '''
+
+                    script {
+                        def result = bat(
+                            returnStatus: true,
+                            script: 'docker pull %IMAGE_NAME%:%ROLLBACK_TAG%'
+                        )
+
+                        if (result != 0) {
+                            echo "Initializing rollback image from v8"
+
+                            bat '''
+                                docker pull %IMAGE_NAME%:%INITIAL_TAG%
+                                if errorlevel 1 exit /b 1
+
+                                docker tag %IMAGE_NAME%:%INITIAL_TAG% %IMAGE_NAME%:%ROLLBACK_TAG%
+
+                                docker push %IMAGE_NAME%:%ROLLBACK_TAG%
+                                if errorlevel 1 exit /b 1
+                            '''
+                        }
+                    }
                 }
             }
         }
 
-        stage('Deploy and Health Check') {
+        stage('Create Dockerfile and Build') {
             steps {
                 script {
-                    withCredentials([
-                        usernamePassword(
-                            credentialsId: 'registry-creds',
-                            usernameVariable: 'REGISTRY_USER',
-                            passwordVariable: 'REGISTRY_PASS'
-                        )
-                    ]) {
-                        try {
-                            bat '''
-                                @echo off
+                    writeFile(
+                        file: 'app/Dockerfile',
+                        text: '''FROM nginx:alpine
+COPY index.html /usr/share/nginx/html/index.html
+EXPOSE 80
+'''
+                    )
+                }
 
-                                echo Logging into Private Registry...
-                                echo %REGISTRY_PASS% | docker login %REGISTRY_URL% -u "%REGISTRY_USER%" --password-stdin
-                                if errorlevel 1 exit /b 1
+                bat '''
+                    @echo off
+                    echo Building Docker image...
 
-                                echo Pulling new image...
-                                docker pull %IMAGE_NAME%:%NEW_TAG%
-                                if errorlevel 1 exit /b 1
+                    docker build -t %IMAGE_NAME%:%NEW_TAG% -f app\\Dockerfile app
 
-                                echo Removing old container...
-                                docker rm -f %CONTAINER_NAME% 2>NUL
+                    if errorlevel 1 exit /b 1
+                '''
+            }
+        }
 
-                                echo Deploying new version...
-                                docker run -d --restart unless-stopped --name %CONTAINER_NAME% -p %APP_PORT%:80 %IMAGE_NAME%:%NEW_TAG%
-                                if errorlevel 1 exit /b 1
-                            '''
+        stage('Push Image') {
+            steps {
+                bat '''
+                    @echo off
+                    docker push %IMAGE_NAME%:%NEW_TAG%
+                    if errorlevel 1 exit /b 1
+                '''
+            }
+        }
 
-                            bat '''
-                                @echo off
-                                echo Waiting for application...
-                                powershell -NoProfile -Command "Start-Sleep -Seconds 10"
-                            '''
+        stage('Deploy and Automatic Rollback') {
+            steps {
+                script {
+                    try {
 
-                            bat '''
-                                @echo off
-                                echo Checking application health...
+                        bat '''
+                            @echo off
 
-                                powershell -NoProfile -Command "$r = Invoke-WebRequest -Uri 'http://localhost:8085/' -UseBasicParsing; if ($r.StatusCode -ne 200 -or $r.Content -notmatch 'Application Version %NEW_TAG%') { exit 1 }"
-                                if errorlevel 1 exit /b 1
-                            '''
+                            docker pull %IMAGE_NAME%:%NEW_TAG%
+                            if errorlevel 1 exit /b 1
 
-                            echo "Deployment successful: ${env.NEW_TAG}"
+                            docker rm -f %CONTAINER_NAME% 2>NUL
 
-                        } catch (Exception deploymentError) {
+                            docker run -d --restart unless-stopped --name %CONTAINER_NAME% -p %APP_PORT%:80 %IMAGE_NAME%:%NEW_TAG%
 
-                            echo "NEW DEPLOYMENT FAILED!"
-                            echo "Starting automatic rollback..."
+                            if errorlevel 1 exit /b 1
+                        '''
 
-                            bat '''
-                                @echo off
+                        bat '''
+                            powershell -NoProfile -Command "Start-Sleep -Seconds 10"
+                        '''
 
-                                echo Removing faulty container...
-                                docker rm -f %CONTAINER_NAME% 2>NUL
+                        echo "Checking new application health..."
 
-                                echo Pulling previous working image...
-                                docker pull %IMAGE_NAME%:%PREVIOUS_TAG%
-                                if errorlevel 1 exit /b 1
+                        bat '''
+                            powershell -NoProfile -Command "$r = Invoke-WebRequest -Uri 'http://localhost:8085/' -UseBasicParsing; if ($r.StatusCode -ne 200 -or $r.Content -notmatch 'Application Version' -or $r.Content -match 'faulty deployment') { exit 1 }"
 
-                                echo Restoring previous version...
-                                docker run -d --restart unless-stopped --name %CONTAINER_NAME% -p %APP_PORT%:80 %IMAGE_NAME%:%PREVIOUS_TAG%
-                                if errorlevel 1 exit /b 1
-                            '''
+                            if errorlevel 1 exit /b 1
+                        '''
 
-                            bat '''
-                                @echo off
+                        echo "NEW DEPLOYMENT SUCCESSFUL!"
 
-                                echo Waiting for rollback application...
-                                powershell -NoProfile -Command "Start-Sleep -Seconds 10"
+                        // Update rollback image only after successful health check.
 
-                                echo Verifying rollback...
-                                powershell -NoProfile -Command "$r = Invoke-WebRequest -Uri 'http://localhost:8085/' -UseBasicParsing; if ($r.StatusCode -ne 200 -or $r.Content -notmatch 'Application Version %PREVIOUS_TAG%') { exit 1 }"
-                                if errorlevel 1 exit /b 1
-                            '''
+                        bat '''
+                            docker tag %IMAGE_NAME%:%NEW_TAG% %IMAGE_NAME%:%ROLLBACK_TAG%
+                            if errorlevel 1 exit /b 1
 
-                            echo "ROLLBACK SUCCESSFUL: ${env.PREVIOUS_TAG}"
+                            docker push %IMAGE_NAME%:%ROLLBACK_TAG%
+                            if errorlevel 1 exit /b 1
+                        '''
 
-                            error("New deployment failed. Previous version restored successfully.")
-                        }
+                        echo "Previous-version backup updated successfully."
+
+                    } catch (Exception e) {
+
+                        echo "NEW DEPLOYMENT FAILED!"
+                        echo "STARTING AUTOMATIC ROLLBACK!"
+
+                        bat '''
+                            @echo off
+
+                            docker rm -f %CONTAINER_NAME% 2>NUL
+
+                            docker pull %IMAGE_NAME%:%ROLLBACK_TAG%
+                            if errorlevel 1 exit /b 1
+
+                            docker run -d --restart unless-stopped --name %CONTAINER_NAME% -p %APP_PORT%:80 %IMAGE_NAME%:%ROLLBACK_TAG%
+
+                            if errorlevel 1 exit /b 1
+                        '''
+
+                        bat '''
+                            powershell -NoProfile -Command "Start-Sleep -Seconds 10"
+                        '''
+
+                        echo "Verifying previous working version..."
+
+                        bat '''
+                            powershell -NoProfile -Command "$r = Invoke-WebRequest -Uri 'http://localhost:8085/' -UseBasicParsing; if ($r.StatusCode -ne 200 -or $r.Content -notmatch 'Application Version' -or $r.Content -match 'faulty deployment') { exit 1 }"
+
+                            if errorlevel 1 exit /b 1
+                        '''
+
+                        echo "AUTOMATIC ROLLBACK SUCCESSFUL!"
+
+                        error("Deployment failed. Previous working version restored.")
                     }
                 }
             }
@@ -142,17 +180,16 @@ pipeline {
     post {
         always {
             bat '''
-                @echo off
                 docker logout %REGISTRY_URL%
             '''
         }
 
         success {
-            echo "PIPELINE SUCCESSFUL - NEW VERSION DEPLOYED!"
+            echo "PIPELINE SUCCESSFUL!"
         }
 
         failure {
-            echo "PIPELINE FAILED - CHECK DEPLOYMENT OR ROLLBACK LOGS."
+            echo "PIPELINE FAILED. CHECK LOGS."
         }
     }
 }
