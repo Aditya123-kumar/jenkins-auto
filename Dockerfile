@@ -1,19 +1,14 @@
-FROM mcr.microsoft.com/dotnet/aspnet:7.0 AS base
-WORKDIR /app
-EXPOSE 80
-EXPOSE 443
-
 FROM mcr.microsoft.com/dotnet/sdk:7.0 AS build
-WORKDIR /Frais-Core-API
-COPY ["Frais-Core-API.csproj", "."]
-RUN dotnet restore "Frais-Core-API.csproj"
+WORKDIR /src
+
 COPY . .
-RUN dotnet build "Frais-Core-API.csproj" -c Release -o /app/build
+RUN dotnet publish Frais-Core-API.csproj -c Release -o /app/publish
 
-FROM build AS publish
-RUN dotnet publish "Frais-Core-API.csproj" -c Release -o /app/publish /p:UseAppHost=false
-
-FROM base AS final
+FROM mcr.microsoft.com/dotnet/aspnet:7.0
 WORKDIR /app
-COPY --from=publish /app/publish .
+
+COPY --from=build /app/publish .
+
+EXPOSE 80
+
 ENTRYPOINT ["dotnet", "Frais-Core-API.dll"]
