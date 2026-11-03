@@ -1,36 +1,103 @@
+
 pipeline {
     agent { label 'QA' }
 
+    options {
+        skipDefaultCheckout(true)
+    }
+
     environment {
-        IMAGE = 'frais-backend'   // <-- apni docker-compose.yml wale image ka naam yahan daalo
+        IMAGE = 'localhost:5000/frais-demo'
+        CONTAINER = 'frais-demo-app'
+        APP_PORT = '8091'
     }
 
     stages {
-        stage("Build") {
+        stage('Checkout') {
             steps {
-                sh "sudo cp /home/azureuser/configfiles/frais/backend/appsettings.json appsettings.json"
-                sh "sudo cp /home/azureuser/configfiles/frais/backend/docker-compose.yml docker-compose.yml"
-
-                // purani working image ka backup (pehli baar image na ho to ignore)
-                sh "sudo docker tag ${IMAGE}:latest ${IMAGE}:rollback || true"
-
-                sh "sudo docker compose down --remove-orphans"
-                sh "sudo docker container prune --force"
-                sh "sudo docker image prune --force"
+                checkout scmGit(
+                    branches: [[name: '*/main']],
+                    userRemoteConfigs: [[
+                        url: 'https://github.com/Aditya123-kumar/jenkins-auto.git'
+                    ]],
+                    gitTool: 'Linux-Git'
+                )
             }
         }
-        stage("Deploy") {
+
+        stage('Build') {
             steps {
-                sh "sudo docker compose -f docker-compose.yml up --build --no-deps --renew-anon-volumes --detach --remove-orphans"
+                sh '''
+                    docker build -t ${IMAGE}:build-${BUILD_NUMBER} \
+                        -f app/Dockerfile app
+                '''
+            }
+        }
+
+        stage('Backup Previous Image') {
+            steps {
+                sh '''
+                    if docker image inspect ${IMAGE}:latest >/dev/null 2>&1; then
+                        docker tag ${IMAGE}:latest ${IMAGE}:rollback
+                        echo "Previous image backed up"
+                    else
+                        echo "No previous latest image; first deployment"
+                    fi
+                '''
+            }
+        }
+
+        stage('Push Image') {
+            steps {
+                sh '''
+                    docker tag ${IMAGE}:build-${BUILD_NUMBER} ${IMAGE}:latest
+                    docker push ${IMAGE}:latest
+                '''
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh '''
+                    docker rm -f ${CONTAINER} 2>/dev/null || true
+
+                    docker run -d \
+                        --name ${CONTAINER} \
+                        --restart unless-stopped \
+                        -p ${APP_PORT}:80 \
+                        ${IMAGE}:latest
+
+                    sleep 5
+                    docker inspect -f '{{.State.Running}}' ${CONTAINER} | grep true
+                    curl -fsS http://localhost:${APP_PORT}/
+                '''
             }
         }
     }
 
     post {
         failure {
-            echo "Deploy fail hua, purani image par rollback ho raha hai"
-            sh "sudo docker tag ${IMAGE}:rollback ${IMAGE}:latest"
-            sh "sudo docker compose -f docker-compose.yml up --no-build --detach --remove-orphans"
+            echo 'Deployment failed. Checking previous image.'
+
+            sh '''
+                if docker image inspect ${IMAGE}:rollback >/dev/null 2>&1; then
+                    docker rm -f ${CONTAINER} 2>/dev/null || true
+
+                    docker run -d \
+                        --name ${CONTAINER} \
+                        --restart unless-stopped \
+                        -p ${APP_PORT}:80 \
+                        ${IMAGE}:rollback
+
+                    echo "Previous image restored"
+                else
+                    echo "No previous image available for rollback"
+                fi
+            '''
+        }
+
+        success {
+            echo 'Deployment completed successfully!'
         }
     }
 }
